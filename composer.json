@@ -1,0 +1,35 @@
+{
+    "name": "frostlake/pdo_frostlake",
+    "description": "PDO driver for the Frostlake SQL engine over its HTTP protocol, with pdo_snowflake's surface",
+    "type": "php-ext",
+    "keywords": [
+        "frostlake",
+        "snowflake",
+        "pdo",
+        "sql",
+        "database",
+        "driver"
+    ],
+    "license": "Apache-2.0",
+    "homepage": "https://frostlake.dev",
+    "authors": [
+        {
+            "name": "MLorek"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/Frostlake-DB/frostlake-pdo/issues",
+        "source": "https://github.com/Frostlake-DB/frostlake-pdo"
+    },
+    "require": {
+        "php": ">=8.1.0 <8.6.0",
+        "ext-pdo": "*"
+    },
+    "php-ext": {
+        "extension-name": "pdo_frostlake",
+        "build-path": "src",
+        "os-families-exclude": [
+            "windows"
+        ]
+    }
+}

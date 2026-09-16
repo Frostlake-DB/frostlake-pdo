@@ -1,0 +1,20 @@
+# What phpize, configure and make leave in this directory
+.libs/
+Makefile
+Makefile.fragments
+Makefile.objects
+autom4te.cache/
+build/
+config.h
+config.h.in
+config.log
+config.nice
+config.status
+configure
+configure.ac
+libtool
+modules/
+run-tests.php
+*.dep
+*.la
+*.lo
