@@ -76,8 +76,11 @@ LOG="$WORK/engine.log"
 JAVA="${JAVA_HOME:+$JAVA_HOME/bin/}java"
 
 # A private user.home keeps this server's stage files apart from any other engine on the machine;
-# without nodelay a keep-alive client waits on every statement.
-"$JAVA" "-Duser.home=$WORK/home" -Dsun.net.httpserver.nodelay=true -cp "$CLASSPATH_FOR_ENGINE" \
+# without nodelay a keep-alive client waits on every statement. An engine build tree on
+# FROSTLAKE_CLASSPATH carries a logger setup that writes db-engine.log into the working directory,
+# so the log is pinned to standard error, where $LOG catches it for the session tests.
+"$JAVA" "-Duser.home=$WORK/home" -Dsun.net.httpserver.nodelay=true \
+    -Dorg.slf4j.simpleLogger.logFile=System.err -cp "$CLASSPATH_FOR_ENGINE" \
     dev.frostlake.http.DatabaseHttpServer "$PORT" > "$LOG" 2>&1 &
 ENGINE_PID=$!
 

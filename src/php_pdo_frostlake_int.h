@@ -39,6 +39,8 @@ enum {
 /* Seconds a statement may take, and seconds the connection check may wait for the server. */
 #define PDO_FROSTLAKE_DEFAULT_TIMEOUT 300
 #define PDO_FROSTLAKE_CONNECT_TIMEOUT 10
+/* The data source's USE statements: role, warehouse, database and schema. */
+#define PDO_FROSTLAKE_SCOPE_MAX 4
 
 typedef struct {
     char *host;
@@ -46,6 +48,23 @@ typedef struct {
     int timeout;
     /* The server-assigned session, pinned by the first answer that names one. */
     char *session_id;
+    /* Whether the engine reports newSession, which arrived together with requireSession and
+     * DELETE /api/sessions: -1 until the first answer that names a session settles it. */
+    int tracks_sessions;
+    /* What the session holds that a fresh one would not: context a statement set up (USE, SET,
+     * ALTER SESSION, a temporary object, CREATE or DROP of a database or schema), and an open
+     * transaction. */
+    bool dirty;
+    bool in_transaction;
+    /* The data source's USE statements, in the order a login applies them, which every session of
+     * the connection starts with; and whether the engine must accept each (the role) or may refuse
+     * it (the rest, as a Snowflake login leaves off one that does not exist). */
+    char *scope[PDO_FROSTLAKE_SCOPE_MAX];
+    bool scope_required[PDO_FROSTLAKE_SCOPE_MAX];
+    int scope_count;
+    /* Set once a lost session was dropped: the scope goes onto a fresh session before the next
+     * statement. */
+    bool scope_pending;
     /* The connection's PDO::FROSTLAKE_STMT_MULTI_STMT_COUNT, copied into each statement it
      * prepares. */
     zend_long multi_statement_count;
@@ -75,9 +94,15 @@ extern const struct pdo_stmt_methods pdo_frostlake_stmt_methods;
  * connection is still being opened there is nobody to report to later, so it throws. */
 void pdo_frostlake_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt, const char *sqlstate, const char *message);
 
-/* Sends one request and answers its parsed response, or NULL after recording why. */
+/* Sends one request and answers its parsed response, or NULL after recording why. A session the
+ * engine no longer holds is replaced by a fresh one on the data source's scope and the request
+ * sent once more, unless the lost session held a transaction or context of its own: that is
+ * refused with 08003. */
 fl_json *pdo_frostlake_execute(pdo_dbh_t *dbh, pdo_stmt_t *stmt, const char *sql, size_t sql_length,
                                zend_long multi_statement_count);
+/* Whether the connection's session is still there to use, without replacing it: a lost session
+ * that held a transaction or context of its own is left for the next statement to report. */
+bool pdo_frostlake_session_alive(pdo_dbh_t *dbh);
 /* Whether the server answers its health check; a failure is recorded on the connection. */
 bool pdo_frostlake_healthy(pdo_dbh_t *dbh);
 void pdo_frostlake_release_session(pdo_frostlake_db_handle *H);
@@ -87,6 +112,10 @@ void pdo_frostlake_release_session(pdo_frostlake_db_handle *H);
 zend_string *pdo_frostlake_render_statement(pdo_stmt_t *stmt, const char **sqlstate, char **message);
 int pdo_frostlake_is_identifier(const char *text);
 int pdo_frostlake_append_json(fl_strbuf *buf, const fl_json *node);
+/* Keeps H's picture of its session in step with a request that succeeded: whether a statement in
+ * it set up context a fresh session would not have, and what it did to the transaction — which,
+ * with autocommit off, any statement but COMMIT or ROLLBACK may leave open. */
+void pdo_frostlake_track_session(pdo_frostlake_db_handle *H, const char *sql, size_t length);
 
 /* The affected-row count of a result set: its update count for DML, its row count otherwise. */
 zend_long pdo_frostlake_result_row_count(const fl_json *result_set);

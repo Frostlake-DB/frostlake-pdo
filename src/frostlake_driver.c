@@ -78,6 +78,9 @@ static void free_handle(pdo_dbh_t *dbh) {
     if (H->errmsg != NULL) {
         pefree(H->errmsg, dbh->is_persistent);
     }
+    for (int i = 0; i < H->scope_count; i++) {
+        pefree(H->scope[i], dbh->is_persistent);
+    }
     pefree(H, dbh->is_persistent);
     dbh->driver_data = NULL;
 }
@@ -210,21 +213,17 @@ static int pdo_frostlake_get_attribute(pdo_dbh_t *dbh, zend_long attr, zval *ret
     }
 }
 
-/* A persistent connection is reused only while its session still exists: a server restart or the
- * idle timeout ends the session, and a reused handle would then fail every statement. */
+/* A persistent connection is reused only while it can go on where it left off. A server restart or
+ * the idle timeout ends the session: one that held nothing of its own is replaced on the data
+ * source's scope and the handle lives on, but one that held a transaction or context is not
+ * reused — PDO opens a new connection instead — and whoever still holds the handle is told on
+ * their next statement. */
 static zend_result pdo_frostlake_check_liveness(pdo_dbh_t *dbh) {
     pdo_frostlake_db_handle *H = dbh->driver_data;
     if (H == NULL) {
         return FAILURE;
     }
-    bool alive;
-    if (H->session_id == NULL) {
-        alive = pdo_frostlake_healthy(dbh);
-    } else {
-        fl_json *response = pdo_frostlake_execute(dbh, NULL, "SELECT 1", strlen("SELECT 1"), PDO_FROSTLAKE_COUNT_UNSET);
-        alive = response != NULL;
-        fl_json_free(response);
-    }
+    bool alive = pdo_frostlake_session_alive(dbh);
     if (!alive && dbh->refcount <= 1) {
         /* PDO abandons the handle now, and some PHP 8.4 releases never close an abandoned
          * persistent handle, so let go of what the driver holds. Only when no PDO object still
@@ -276,6 +275,11 @@ static bool use_object(pdo_dbh_t *dbh, const char *kind, const char *name, bool 
 
     char *sql;
     size_t sql_length = spprintf(&sql, 0, "USE %s %s", kind, name);
+    /* Kept, to go onto a fresh session should this one be lost. */
+    pdo_frostlake_db_handle *scoped = dbh->driver_data;
+    scoped->scope[scoped->scope_count] = pestrdup(sql, dbh->is_persistent);
+    scoped->scope_required[scoped->scope_count] = required;
+    scoped->scope_count++;
     /* While connecting a refusal would throw at once; decide first whether it is one. */
     const struct pdo_dbh_methods *connecting = dbh->methods;
     dbh->methods = &pdo_frostlake_methods;
@@ -319,6 +323,7 @@ static int pdo_frostlake_handle_factory(pdo_dbh_t *dbh, zval *driver_options) {
     pdo_frostlake_db_handle *H = pecalloc(1, sizeof(pdo_frostlake_db_handle), dbh->is_persistent);
     dbh->driver_data = H;
     H->host = pestrdup(vars[HOST].optval, dbh->is_persistent);
+    H->tracks_sessions = -1;
     H->multi_statement_count = PDO_FROSTLAKE_COUNT_UNSET;
     H->opened_auto_commit = dbh->auto_commit;
     H->timeout = (int) pdo_attr_lval(driver_options, PDO_ATTR_TIMEOUT, PDO_FROSTLAKE_DEFAULT_TIMEOUT);
@@ -348,6 +353,9 @@ static int pdo_frostlake_handle_factory(pdo_dbh_t *dbh, zval *driver_options) {
             || !use_object(dbh, "SCHEMA", vars[SCHEMA].optval, false)) {
         goto cleanup;
     }
+    /* The scope is where every session of the connection starts, not context of its own. */
+    H->dirty = false;
+    H->in_transaction = false;
 
     dbh->alloc_own_columns = 1;
     dbh->methods = &pdo_frostlake_methods;

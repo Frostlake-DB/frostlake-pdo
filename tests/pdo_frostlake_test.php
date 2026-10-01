@@ -99,7 +99,7 @@ function server(string $method, string $path): array
  * The id is the wire's, which no SQL function reports, so it is read from the log of the server
  * tests/run.sh started (FROSTLAKE_ENGINE_LOG); attached to any other server, the test skips.
  */
-function connect_with_session(array $options = []): array
+function connect_with_session(array $options = [], string $extra = ''): array
 {
     $log = getenv('FROSTLAKE_ENGINE_LOG');
     if ($log === false || !is_readable($log)) {
@@ -107,7 +107,7 @@ function connect_with_session(array $options = []): array
     }
     clearstatcache();
     $offset = filesize($log);
-    $pdo = connect($options);
+    $pdo = connect($options, $extra);
     $pdo->query('SELECT 1');
     return [$pdo, created_session($log, $offset)];
 }
@@ -374,6 +374,38 @@ test('a colon or question mark that is not a placeholder', function () {
         $st->fetch(PDO::FETCH_ASSOC), 'paths, casts, strings, identifiers and comments keep their text');
 });
 
+test('a colon after a closing brace reads a field', function () {
+    $pdo = connect();
+    $st = $pdo->prepare("SELECT {'k': 7}:k::INT braced, :n::INT named");
+    $st->execute([':n' => '9']);
+    same(['BRACED' => '7', 'NAMED' => '9'], $st->fetch(PDO::FETCH_ASSOC), 'a field of an OBJECT constant beside a named parameter');
+});
+
+test('a colon after a ? reads a field of the bound value', function () {
+    $pdo = connect();
+    $st = $pdo->prepare('SELECT ?:k path, ? plain');
+    $st->bindValue(1, 5, PDO::PARAM_INT);
+    $st->bindValue(2, 'x');
+    $st->execute();
+    same(['PATH' => null, 'PLAIN' => 'x'], $st->fetch(PDO::FETCH_ASSOC), 'a number has no field k');
+
+    $spaced = $pdo->prepare('SELECT ? :k');
+    $spaced->bindValue(1, 1);
+    $spaced->bindValue(':k', 2);
+    $e = refusal(fn () => $spaced->execute());
+    check(str_contains((string) $e?->getMessage(), 'mixed named and positional parameters'),
+        'with a blank before it the colon opens a parameter again: ' . $e?->getMessage());
+});
+
+test('a colon after a closing quote opens no parameter', function () {
+    $pdo = connect();
+    $st = $pdo->prepare("SELECT {'k':n} obj, ? p FROM (SELECT 7 n)");
+    $st->execute(['x']);
+    $row = $st->fetch(PDO::FETCH_NUM);
+    same(['k' => 7], json_decode($row[0], true), 'an OBJECT constant with no blank after its key');
+    same('x', $row[1], 'the marker beside it');
+});
+
 test('a negative number after a minus sign stays arithmetic', function () {
     $pdo = connect();
     $st = $pdo->prepare("SELECT 10 -? AS a, 10 -? AS b, 10 -? AS c
@@ -407,23 +439,31 @@ test('a statement with nothing bound goes as written', function () {
 });
 
 test('parameter mismatches are HY093', function () {
+    // PDO writes the SQLSTATE and its description in front of the driver's own text.
+    $count = 'SQLSTATE[HY093]: Invalid parameter number: number of bound variables does not match number of tokens';
     $pdo = connect();
     $st = $pdo->prepare('SELECT ? a, ? b');
     $e = refusal(fn () => $st->execute(['only one']));
     same('HY093', $e?->getCode(), 'too few');
+    same($count, $e?->getMessage(), 'the message for too few');
     $e = refusal(fn () => $st->execute(['1', '2', '3']));
     same('HY093', $e?->getCode(), 'too many');
+    same($count, $e?->getMessage(), 'the message for too many');
 
     $named = $pdo->prepare('SELECT :a a');
     $e = refusal(fn () => $named->execute([':b' => 1]));
     same('HY093', $e?->getCode(), 'an unknown name');
-    check(str_contains((string) $e?->getMessage(), ':a'), 'the message names the missing parameter: ' . $e?->getMessage());
+    same('SQLSTATE[HY093]: Invalid parameter number: parameter was not defined: :a', $e?->getMessage(),
+        'the message names the missing parameter');
+    same(['HY093', null, 'parameter was not defined: :a'], $e?->errorInfo, 'errorInfo holds the driver\'s text alone');
 
     $mixed = $pdo->prepare('SELECT :a a, ? b');
     $mixed->bindValue(':a', 1);
     $mixed->bindValue(1, 2);
     $e = refusal(fn () => $mixed->execute());
     same('HY093', $e?->getCode(), 'named and positional mixed');
+    same('SQLSTATE[HY093]: Invalid parameter number: mixed named and positional parameters', $e?->getMessage(),
+        'the message for mixed styles');
 });
 
 test('debugDumpParams shows the SQL that was sent', function () {
@@ -599,6 +639,408 @@ test('a persistent connection is reused while its session lives', function () {
     same($default, $fresh->query('SELECT CURRENT_DATABASE()')->fetchColumn(), 'which starts afresh');
 });
 
+test('a lost session that held nothing is replaced on the data source\'s scope', function () {
+    $setup = connect();
+    $setup->exec('CREATE OR REPLACE DATABASE pdo_lost_db');
+    [$pdo, $session] = connect_with_session([], ';database=pdo_lost_db');
+    server('DELETE', "/api/sessions/$session");
+    same('PDO_LOST_DB', $pdo->query('SELECT CURRENT_DATABASE()')->fetchColumn(),
+        'the statement ran once more, on a fresh session on the data source\'s database');
+});
+
+test('a lost session with a transaction open is reported, and the connection carries on', function () {
+    $setup = connect();
+    $setup->exec('CREATE OR REPLACE DATABASE pdo_lost_txn_db');
+    $setup->exec('CREATE TABLE pdo_lost_txn_db.public.t (id INT)');
+    [$pdo, $session] = connect_with_session([], ';database=pdo_lost_txn_db');
+    $pdo->beginTransaction();
+    $pdo->exec('INSERT INTO t VALUES (1)');
+    server('DELETE', "/api/sessions/$session");
+    $e = refusal(fn () => $pdo->exec('INSERT INTO t VALUES (2)'));
+    same('08003', $e?->errorInfo[0] ?? null, 'SQLSTATE');
+    check(str_contains((string) $e?->getMessage(), 'transaction'), 'the message says what was lost: ' . $e?->getMessage());
+    check($pdo->rollBack(), 'PDO\'s own transaction can still be ended');
+    same(['PDO_LOST_TXN_DB', '0'], $pdo->query('SELECT CURRENT_DATABASE(), COUNT(*) FROM t')->fetch(PDO::FETCH_NUM),
+        'neither insert survived, and the connection carries on on its scope');
+});
+
+test('closing a connection lowers the active sessions by one', function () {
+    $pdo = connect();
+    $pdo->query('SELECT 1');
+    $before = server('GET', '/api/sessions')['activeSessions'] ?? null;
+    $pdo = null;
+    same(is_int($before) ? $before - 1 : 'a count', server('GET', '/api/sessions')['activeSessions'] ?? null,
+        'active sessions');
+});
+
+// ---------------------------------------------------------------- sessions, scripted
+//
+// Against tests/scripted_engine.php, which answers every request from a script and records it, so
+// each scenario decides every answer and sees every request — no engine needed.
+
+/** The scripted engine, started on first use: its port and its directory. */
+function scripted_engine(): array
+{
+    static $engine = null;
+    if ($engine !== null) {
+        return $engine;
+    }
+    $dir = sys_get_temp_dir() . '/frostlake-pdo-scripted-' . getmypid();
+    if (!is_dir($dir) && !mkdir($dir)) {
+        throw new RuntimeException("cannot create $dir");
+    }
+    file_put_contents("$dir/script.json", '[]');
+    file_put_contents("$dir/sent.jsonl", '');
+    $process = proc_open([PHP_BINARY, '-n', __DIR__ . '/scripted_engine.php', $dir],
+        [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
+    register_shutdown_function(function () use ($process, $dir) {
+        if (is_resource($process)) {
+            proc_terminate($process);
+        }
+        foreach (glob("$dir/*") ?: [] as $file) {
+            unlink($file);
+        }
+        @rmdir($dir);
+    });
+    for ($attempt = 0; $attempt < 200 && !is_file("$dir/port"); $attempt++) {
+        usleep(25_000);
+    }
+    if (!is_file("$dir/port")) {
+        throw new RuntimeException('the scripted engine did not start');
+    }
+    $engine = [(int) file_get_contents("$dir/port"), $dir];
+    return $engine;
+}
+
+/** Forgets every script and request, and scripts the health check a connection starts with. */
+function script_afresh(): void
+{
+    [, $dir] = scripted_engine();
+    file_put_contents("$dir/script.json", '[]');
+    file_put_contents("$dir/sent.jsonl", '');
+    answer_with('{"status":"healthy","activeSessions":0}');
+}
+
+/** Queues the scripted engine's answer to the next request. */
+function answer_with(string $body, int $status = 200): void
+{
+    [, $dir] = scripted_engine();
+    $script = json_decode((string) file_get_contents("$dir/script.json"), true) ?: [];
+    $script[] = ['status' => $status, 'body' => $body];
+    file_put_contents("$dir/script.json", json_encode($script));
+}
+
+/** Queues a step that is no answer at all: 'hang' or 'close'. */
+function answer_nothing(string $how): void
+{
+    [, $dir] = scripted_engine();
+    $script = json_decode((string) file_get_contents("$dir/script.json"), true) ?: [];
+    $script[] = [$how => true];
+    file_put_contents("$dir/script.json", json_encode($script));
+}
+
+function unanswered(): int
+{
+    [, $dir] = scripted_engine();
+    return count(json_decode((string) file_get_contents("$dir/script.json"), true) ?: []);
+}
+
+/** @return list<array{verb: string, path: string, payload: ?array}> */
+function requests_sent(): array
+{
+    [, $dir] = scripted_engine();
+    $sent = [];
+    foreach (file("$dir/sent.jsonl", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+        $sent[] = json_decode($line, true);
+    }
+    return $sent;
+}
+
+/** @return list<array> the body of every POST /api/execute, in order */
+function executes_sent(): array
+{
+    $payloads = [];
+    foreach (requests_sent() as $sent) {
+        if ($sent['path'] === '/api/execute') {
+            $payloads[] = $sent['payload'];
+        }
+    }
+    return $payloads;
+}
+
+/** @return list<string> the SQL of every POST /api/execute, in order */
+function statements_sent(): array
+{
+    return array_map(fn ($payload) => $payload['sql'], executes_sent());
+}
+
+const SCRIPTED_SCOPE = ['USE DATABASE APP', 'USE SCHEMA PUBLIC'];
+const STATUS_SET = ['columns' => [['dataType' => 'VARCHAR', 'name' => 'status']],
+    'rows' => [['Statement executed successfully.']], 'rowCount' => 1, 'updateCount' => -1];
+
+function number_set(string $name, int $value): array
+{
+    return ['columns' => [['dataType' => 'NUMBER', 'name' => $name, 'precision' => 38, 'scale' => 0]],
+        'rows' => [[$value]], 'rowCount' => 1, 'updateCount' => -1];
+}
+
+/** From an engine that reports newSession, as 0.1.0 and later do. */
+function engine_answer(string $session, bool $started, array $sets = [STATUS_SET]): string
+{
+    return json_encode(['success' => true, 'sessionId' => $session, 'newSession' => $started,
+        'errorMessage' => null, 'executionTimeMs' => 1, 'resultSets' => $sets]);
+}
+
+/** From an engine that predates newSession, requireSession and the release. */
+function legacy_answer(string $session, array $sets = [STATUS_SET]): string
+{
+    return json_encode(['success' => true, 'sessionId' => $session, 'errorMessage' => null,
+        'executionTimeMs' => 1, 'resultSets' => $sets]);
+}
+
+function refused_answer(string $session, string $message): string
+{
+    return json_encode(['success' => false, 'sessionId' => $session, 'newSession' => false,
+        'errorMessage' => $message, 'executionTimeMs' => 0, 'resultSets' => []]);
+}
+
+/** The 404 a request that requires its session gets once the session is gone. */
+function session_gone(string $session): string
+{
+    return json_encode(['success' => false, 'sessionId' => null, 'newSession' => false,
+        'errorMessage' => "Session '$session' does not exist or has expired.", 'executionTimeMs' => 0,
+        'resultSets' => []]);
+}
+
+const RELEASED = '{"success":true,"sessionId":null,"newSession":false,"errorMessage":null,"resultSets":[]}';
+
+/** A connection whose data source's scope went onto session s1 of a scripted engine that reports newSession. */
+function scripted_connection(array $options = []): PDO
+{
+    [$port] = scripted_engine();
+    script_afresh();
+    answer_with(engine_answer('s1', true));
+    answer_with(engine_answer('s1', false));
+    return new PDO("frostlake:host=127.0.0.1;port=$port;database=APP;schema=PUBLIC", null, null,
+        $options + [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+}
+
+/** Answers a fresh session s2 for the scope a lost one is replaced with. */
+function answer_scope_on_s2(): void
+{
+    answer_with(engine_answer('s2', true));
+    answer_with(engine_answer('s2', false));
+}
+
+test('requireSession waits until the engine says it tracks sessions', function () {
+    $pdo = scripted_connection();
+    [$first, $second] = executes_sent();
+    same(false, array_key_exists('sessionId', $first), 'the first request names no session');
+    same(false, array_key_exists('requireSession', $first), 'so it requires none');
+    same(['s1', true], [$second['sessionId'] ?? null, $second['requireSession'] ?? null],
+        'its answer carried newSession, so the next requires its session');
+    answer_with(engine_answer('s1', false, [number_set('N', 1)]));
+    same('1', $pdo->query('SELECT 1 AS N')->fetchColumn(), 'the statement');
+    same(true, executes_sent()[2]['requireSession'] ?? null, 'statements require it too');
+});
+
+test('an older engine is sent neither requireSession nor a release', function () {
+    [$port] = scripted_engine();
+    script_afresh();
+    answer_with(legacy_answer('old1'));
+    answer_with(legacy_answer('old1'));
+    answer_with(legacy_answer('old1', [number_set('N', 1)]));
+    $pdo = new PDO("frostlake:host=127.0.0.1;port=$port;database=APP;schema=PUBLIC");
+    $pdo->query('SELECT 1 AS N');
+    same([null, 'old1', 'old1'], array_map(fn ($p) => $p['sessionId'] ?? null, executes_sent()), 'session ids');
+    foreach (executes_sent() as $payload) {
+        check(!array_key_exists('requireSession', $payload), 'no requireSession: ' . json_encode($payload));
+    }
+    $pdo = null;
+    same(4, count(requests_sent()), 'closing sent nothing');
+});
+
+test('a lost session is replaced on the data source\'s scope and the statement sent once more', function () {
+    $pdo = scripted_connection();
+    answer_with(session_gone('s1'), 404);
+    answer_scope_on_s2();
+    answer_with(engine_answer('s2', false, [number_set('N', 1)]));
+    same('1', $pdo->query('SELECT 1 AS N')->fetchColumn(), 'the answer');
+    same([...SCRIPTED_SCOPE, 'SELECT 1 AS N', ...SCRIPTED_SCOPE, 'SELECT 1 AS N'], statements_sent(), 'statements');
+    $executes = executes_sent();
+    same(false, array_key_exists('sessionId', $executes[3]), 'the scope went onto a fresh session');
+    same('s2', $executes[5]['sessionId'] ?? null, 'and the statement after it');
+    same(0, unanswered(), 'every answer taken');
+});
+
+test('a prepared statement meets a lost session the same way', function () {
+    $pdo = scripted_connection();
+    $st = $pdo->prepare('SELECT ? AS N');
+    answer_with(session_gone('s1'), 404);
+    answer_scope_on_s2();
+    answer_with(engine_answer('s2', false, [number_set('N', 7)]));
+    $st->execute([7]);
+    same('7', $st->fetchColumn(), 'the answer');
+    same([...SCRIPTED_SCOPE, "SELECT '7' AS N", ...SCRIPTED_SCOPE, "SELECT '7' AS N"], statements_sent(), 'statements');
+});
+
+test('a second refusal raises instead of trying again', function () {
+    $pdo = scripted_connection();
+    answer_with(session_gone('s1'), 404);
+    answer_scope_on_s2();
+    answer_with(session_gone('s2'), 404);
+    $e = refusal(fn () => $pdo->query('SELECT 1 AS N'));
+    same('08003', $e?->errorInfo[0] ?? null, 'SQLSTATE');
+    same([...SCRIPTED_SCOPE, 'SELECT 1 AS N', ...SCRIPTED_SCOPE, 'SELECT 1 AS N'], statements_sent(), 'statements');
+    same(0, unanswered(), 'every answer taken');
+});
+
+test('a lost session with an open transaction is reported, not replaced', function () {
+    $pdo = scripted_connection();
+    answer_with(engine_answer('s1', false));
+    $pdo->beginTransaction();
+    answer_with(session_gone('s1'), 404);
+    $e = refusal(fn () => $pdo->exec('INSERT INTO t VALUES (1)'));
+    same('08003', $e?->errorInfo[0] ?? null, 'SQLSTATE');
+    check(str_contains((string) $e?->getMessage(), 'transaction'), 'message: ' . $e?->getMessage());
+    same([...SCRIPTED_SCOPE, 'BEGIN', 'INSERT INTO t VALUES (1)'], statements_sent(), 'nothing re-sent');
+    // The connection stays usable: PDO's transaction ends, and the next statement starts over on
+    // the data source's scope.
+    answer_scope_on_s2();
+    answer_with(engine_answer('s2', false));
+    answer_with(engine_answer('s2', false, [number_set('N', 1)]));
+    check($pdo->rollBack(), 'rollBack');
+    same('1', $pdo->query('SELECT 1 AS N')->fetchColumn(), 'the next statement');
+    same([...SCRIPTED_SCOPE, 'ROLLBACK', 'SELECT 1 AS N'], array_slice(statements_sent(), -4), 'on a fresh session');
+    same(0, unanswered(), 'every answer taken');
+});
+
+test('with autocommit off, a lost session after any statement is reported', function () {
+    // Such a session opens a transaction of its own with the statement, and it went with the session.
+    $pdo = scripted_connection([PDO::ATTR_AUTOCOMMIT => false]);
+    answer_with(engine_answer('s1', false, [number_set('number of rows inserted', 1)]));
+    $pdo->exec('INSERT INTO t VALUES (1)');
+    answer_with(session_gone('s1'), 404);
+    $e = refusal(fn () => $pdo->exec('INSERT INTO t VALUES (2)'));
+    same('08003', $e?->errorInfo[0] ?? null, 'SQLSTATE');
+    check(str_contains((string) $e?->getMessage(), 'transaction'), 'message: ' . $e?->getMessage());
+    // Once committed, there is nothing left to lose.
+    answer_scope_on_s2();
+    answer_with(engine_answer('s2', false));
+    $pdo->exec('COMMIT');
+    answer_with(session_gone('s2'), 404);
+    answer_with(engine_answer('s3', true));
+    answer_with(engine_answer('s3', false));
+    answer_with(engine_answer('s3', false, [number_set('N', 1)]));
+    same('1', $pdo->query('SELECT 1 AS N')->fetchColumn(), 'replaced after a COMMIT');
+    same(0, unanswered(), 'every answer taken');
+});
+
+test('a lost session whose context moved is reported, not replaced', function () {
+    $pdo = scripted_connection();
+    answer_with(engine_answer('s1', false));
+    $pdo->exec('USE SCHEMA OTHER');
+    answer_with(session_gone('s1'), 404);
+    $e = refusal(fn () => $pdo->query('SELECT * FROM t'));
+    same('08003', $e?->errorInfo[0] ?? null, 'SQLSTATE');
+    check(str_contains((string) $e?->getMessage(), 'context'), 'message: ' . $e?->getMessage());
+    same([...SCRIPTED_SCOPE, 'USE SCHEMA OTHER', 'SELECT * FROM t'], statements_sent(), 'nothing re-sent');
+    answer_scope_on_s2();
+    answer_with(engine_answer('s2', false, [number_set('N', 1)]));
+    same('1', $pdo->query('SELECT 1 AS N')->fetchColumn(), 'then back on the data source\'s scope');
+    same([...SCRIPTED_SCOPE, 'SELECT 1 AS N'], array_slice(statements_sent(), -3), 'not the schema it had moved to');
+});
+
+test('session state is noticed anywhere in a request', function () {
+    foreach (['SET x = 1', "ALTER SESSION SET TIMEZONE = 'UTC'", 'CREATE TEMPORARY TABLE t (a INT)',
+                 'CREATE DATABASE other', 'UNSET x', 'begin'] as $statement) {
+        $pdo = scripted_connection();
+        $pdo->setAttribute(PDO::FROSTLAKE_STMT_MULTI_STMT_COUNT, 2);
+        answer_with(engine_answer('s1', false, [number_set('N', 1), STATUS_SET]));
+        $pdo->query("SELECT 1 AS N; $statement");
+        answer_with(session_gone('s1'), 404);
+        same('08003', refusal(fn () => $pdo->query('SELECT 2'))?->errorInfo[0] ?? null, $statement);
+        same(0, unanswered(), "$statement: nothing re-sent");
+    }
+});
+
+test('a refused statement leaves the session as it was', function () {
+    $pdo = scripted_connection();
+    answer_with(refused_answer('s1', "Schema 'NOPE' does not exist or not authorized."));
+    refusal(fn () => $pdo->exec('USE SCHEMA NOPE'));
+    answer_with(session_gone('s1'), 404);
+    answer_scope_on_s2();
+    answer_with(engine_answer('s2', false, [number_set('N', 1)]));
+    same('1', $pdo->query('SELECT 1 AS N')->fetchColumn(), 'replaced, since nothing moved');
+});
+
+test('a fresh session leaves off what its scope cannot select, as a login does', function () {
+    $pdo = scripted_connection();
+    answer_with(session_gone('s1'), 404);
+    answer_with(refused_answer('s2', "Database 'APP' does not exist or not authorized."));
+    answer_with(engine_answer('s2', false));
+    answer_with(engine_answer('s2', false, [number_set('N', 1)]));
+    same('1', $pdo->query('SELECT 1 AS N')->fetchColumn(), 'the statement still runs');
+    same([...SCRIPTED_SCOPE, 'SELECT 1 AS N', ...SCRIPTED_SCOPE, 'SELECT 1 AS N'], statements_sent(), 'statements');
+    same(['00000', null, null], $pdo->errorInfo(), 'and no error is left behind');
+});
+
+test('a session the engine replaced gets its scope back before the next statement', function () {
+    $pdo = scripted_connection();
+    answer_with(engine_answer('s1', true, [number_set('N', 1)]));
+    $pdo->query('SELECT 1 AS N');
+    answer_with(engine_answer('s1', false));
+    answer_with(engine_answer('s1', false));
+    answer_with(engine_answer('s1', false, [number_set('N', 2)]));
+    $pdo->query('SELECT 2 AS N');
+    same([...SCRIPTED_SCOPE, 'SELECT 1 AS N', ...SCRIPTED_SCOPE, 'SELECT 2 AS N'], statements_sent(), 'statements');
+});
+
+test('closing releases the session once', function () {
+    $pdo = scripted_connection();
+    answer_with(RELEASED);
+    $pdo = null;
+    $sent = requests_sent();
+    same(['DELETE', '/api/sessions/s1'], [end($sent)['verb'], end($sent)['path']], 'the release');
+    same(0, unanswered(), 'every answer taken');
+    same(4, count($sent), 'and nothing else');
+});
+
+test('closing never raises whatever the release meets', function () {
+    foreach ([
+        'a session already gone' => fn () => answer_with(session_gone('s1'), 404),
+        'an engine without the endpoint' => fn () => answer_with('<html><body>405 Method Not Allowed</body></html>', 405),
+        'a closed connection' => fn () => answer_nothing('close'),
+        'a server that never answers' => fn () => answer_nothing('hang'),
+    ] as $what => $release) {
+        $pdo = scripted_connection([PDO::ATTR_TIMEOUT => 1]);
+        $release();
+        $started = microtime(true);
+        $pdo = null;
+        $took = microtime(true) - $started;
+        same(0, unanswered(), "$what: the release was sent");
+        check($took < 5, sprintf('%s: the release took %.1fs', $what, $took));
+    }
+});
+
+test('a persistent connection whose lost session held nothing lives on', function () {
+    [$port] = scripted_engine();
+    $dsn = "frostlake:host=127.0.0.1;port=$port;database=APP;schema=PUBLIC";
+    $pdo = scripted_connection([PDO::ATTR_PERSISTENT => 'pdo-scripted']);
+    $pdo = null;
+    // Taken again: its session is gone, but held nothing, so the check that reuses the handle
+    // replaces it on the scope instead of opening a new connection.
+    answer_with(session_gone('s1'), 404);
+    answer_scope_on_s2();
+    answer_with(engine_answer('s2', false, [number_set('1', 1)]));
+    answer_with(engine_answer('s2', false, [number_set('N', 2)]));
+    $again = new PDO($dsn, null, null, [PDO::ATTR_PERSISTENT => 'pdo-scripted']);
+    same('2', $again->query('SELECT 2 AS N')->fetchColumn(), 'the statement');
+    same([...SCRIPTED_SCOPE, 'SELECT 1', ...SCRIPTED_SCOPE, 'SELECT 1', 'SELECT 2 AS N'], statements_sent(),
+        'no new health check, no new connection');
+    same(0, unanswered(), 'every answer taken');
+});
+
 // ---------------------------------------------------------------- errors
 
 test('a refused statement raises the engine\'s message', function () {
@@ -639,6 +1081,29 @@ test('what pdo_snowflake leaves out', function () {
     same(false, $pdo->lastInsertId(), 'lastInsertId answers false');
     $e = refusal(fn () => $pdo->quote('x'));
     same('IM001', $e?->getCode(), 'quote() is not supported');
+});
+
+// ---------------------------------------------------------------- the testkit corpus
+//
+// tests/testkit_runner.php, run through tests/run.sh as it always is: with this build of the
+// extension, against FROSTLAKE_URL or a server of its own. The corpus follows the engine it comes
+// from, so it replays only against an engine named outright, never the released jar the suite
+// otherwise starts.
+
+test('the testkit corpus replays through the driver', function () {
+    $corpus = getenv('FL_CORPUS');
+    if ($corpus === false || $corpus === '') {
+        throw new Skipped("set FL_CORPUS to frostlake's engine/src/test/resources/testkit to replay the testkit corpus");
+    }
+    if ((glob("$corpus/suites/*.json") ?: []) === []) {
+        check(false, "FL_CORPUS=$corpus holds no suites/*.json");
+        return;
+    }
+    if (!getenv('FROSTLAKE_URL') && !getenv('FROSTLAKE_CLASSPATH')) {
+        throw new Skipped('no engine named for the corpus: set FROSTLAKE_CLASSPATH or FROSTLAKE_URL');
+    }
+    $replay = proc_open([__DIR__ . '/run.sh', __DIR__ . '/testkit_runner.php'], [STDIN, STDOUT, STDERR], $pipes);
+    same(0, $replay === false ? null : proc_close($replay), 'the exit status of tests/run.sh tests/testkit_runner.php');
 });
 
 // ---------------------------------------------------------------- summary

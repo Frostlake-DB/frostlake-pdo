@@ -96,16 +96,18 @@ static const char *skip_non_placeholder(const char *start, const char *c, const 
 /* Whether the `:` at `c` opens a named parameter.
  *
  * A name must follow, so `::` (a cast), `:=` (an assignment) and `:1` (a positional reference) are
- * never parameters. Nor is a colon glued to the end of an expression — `v:field`,
- * `PARSE_JSON('{}'):k`, `"V":k`, `arr[0]:k` — which reads a field of a semi-structured value. */
+ * never parameters. Nor is a colon straight after the end of an operand — a word character, a
+ * closing parenthesis, bracket, brace or quote, or a `?` — which reads a field of a semi-structured
+ * value: `v:field`, `PARSE_JSON('{}'):k`, `arr[0]:k`, `{'k': 1}:k`, `"V":k`, `?:k`. With a blank
+ * before it, the colon opens a parameter again. */
 static int opens_named_parameter(const char *start, const char *c, const char *end) {
     if (c + 1 >= end || !(isalpha((unsigned char) c[1]) || c[1] == '_')) {
         return 0;
     }
     if (c > start) {
         unsigned char prev = (unsigned char) c[-1];
-        if (isalnum(prev) || prev == '_' || prev == '$' || prev == ')' || prev == ']'
-                || prev == '\'' || prev == '"' || prev == ':') {
+        if (isalnum(prev) || prev == '_' || prev == '$' || prev == ')' || prev == ']' || prev == '}'
+                || prev == '\'' || prev == '"' || prev == '?' || prev == ':') {
             return 0;
         }
     }
@@ -375,6 +377,8 @@ static int append_value(fl_strbuf *buf, struct pdo_bound_param_data *param,
     }
 }
 
+/* A refusal's *message is the detail alone. PDO writes the SQLSTATE and its description in front of
+ * it: "SQLSTATE[HY093]: Invalid parameter number: parameter was not defined: :id". */
 zend_string *pdo_frostlake_render_statement(pdo_stmt_t *stmt, const char **sqlstate, char **message) {
     /* With nothing bound, every marker is the engine's to read — a Snowflake Scripting cursor
      * opened USING (...) binds its own `?` — so the text goes through untouched. */
@@ -409,7 +413,7 @@ zend_string *pdo_frostlake_render_statement(pdo_stmt_t *stmt, const char **sqlst
                 zend_hash_index_find_ptr(stmt->bound_params, (zend_ulong) position);
             if (param == NULL) {
                 *sqlstate = "HY093";
-                *message = estrdup("Invalid parameter number: number of bound variables does not match number of tokens");
+                *message = estrdup("number of bound variables does not match number of tokens");
                 goto fail;
             }
             if (append_value(&out, param, sqlstate, message) != 0) {
@@ -430,7 +434,7 @@ zend_string *pdo_frostlake_render_statement(pdo_stmt_t *stmt, const char **sqlst
             if (param == NULL) {
                 *sqlstate = "HY093";
                 smart_str text = {0};
-                smart_str_appends(&text, "Invalid parameter number: parameter was not defined: ");
+                smart_str_appends(&text, "parameter was not defined: ");
                 smart_str_appendl(&text, c, (size_t) (name_end - c));
                 smart_str_0(&text);
                 *message = estrndup(ZSTR_VAL(text.s), ZSTR_LEN(text.s));
@@ -452,14 +456,14 @@ zend_string *pdo_frostlake_render_statement(pdo_stmt_t *stmt, const char **sqlst
 
     if (positional && named) {
         *sqlstate = "HY093";
-        *message = estrdup("Invalid parameter number: mixed named and positional parameters");
+        *message = estrdup("mixed named and positional parameters");
         goto fail;
     }
     uint32_t bound = zend_hash_num_elements(stmt->bound_params);
     uint32_t consumed = positional ? (uint32_t) position : zend_hash_num_elements(&used_names);
     if (consumed != bound) {
         *sqlstate = "HY093";
-        *message = estrdup("Invalid parameter number: number of bound variables does not match number of tokens");
+        *message = estrdup("number of bound variables does not match number of tokens");
         goto fail;
     }
 
@@ -475,4 +479,159 @@ fail:
     zend_hash_destroy(&used_names);
     fl_strbuf_free(&out);
     return NULL;
+}
+
+/* ---------------------------------------------------------------- session tracking
+ *
+ * What a statement leaves on the session, read with the same scanner as the placeholders, so that
+ * the two cannot disagree about what is code and what is quoted. */
+
+#define SESSION_WORDS 16
+#define SESSION_WORD_MAX 32
+
+/* A byte of an unquoted identifier or keyword: `$` is one, which is why A$$B is a name, and so is
+ * every byte of a multibyte letter. */
+static int is_word_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c == '$' || c >= 0x80;
+}
+
+/* Up to SESSION_WORDS leading words of the statement [c, end), upper-cased, skipping blanks and
+ * comments and stopping at the first thing that is not a word. A word too long for the buffer is
+ * cut short, which no keyword is. */
+static int leading_words(const char *c, const char *end, char words[SESSION_WORDS][SESSION_WORD_MAX]) {
+    int count = 0;
+    while (count < SESSION_WORDS && c < end) {
+        if (isspace((unsigned char) *c)) {
+            c++;
+        } else if (c + 1 < end && ((c[0] == '-' && c[1] == '-') || (c[0] == '/' && c[1] == '/'))) {
+            const char *line_end = memchr(c + 2, '\n', (size_t) (end - (c + 2)));
+            c = line_end != NULL ? line_end + 1 : end;
+        } else if (c + 1 < end && c[0] == '/' && c[1] == '*') {
+            const char *p = c + 2;
+            while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) {
+                p++;
+            }
+            c = p + 1 < end ? p + 2 : end;
+        } else if (is_word_byte((unsigned char) *c)) {
+            size_t length = 0;
+            while (c < end && is_word_byte((unsigned char) *c)) {
+                if (length + 1 < SESSION_WORD_MAX) {
+                    words[count][length++] = (char) toupper((unsigned char) *c);
+                }
+                c++;
+            }
+            words[count][length] = '\0';
+            count++;
+        } else {
+            break;
+        }
+    }
+    return count;
+}
+
+static int is_one_of(const char *word, const char *const *set) {
+    for (; *set != NULL; set++) {
+        if (strcmp(word, *set) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The words that may sit between CREATE, DROP or ALTER and the kind of object being named. */
+static const char *const object_modifiers[] = {
+    "OR", "REPLACE", "TRANSIENT", "TEMPORARY", "TEMP", "VOLATILE", "LOCAL", "GLOBAL", "SECURE", "IF",
+    "NOT", "EXISTS", "PUBLIC", "PRIVATE", "ICEBERG", "DYNAMIC", "HYBRID", "EVENT", "RECURSIVE",
+    "MATERIALIZED", "EXTERNAL", NULL
+};
+
+static const char *const temporary_modifiers[] = {"TEMPORARY", "TEMP", "VOLATILE", NULL};
+
+/* Whether a statement leaves behind state a fresh session would not have: a moved scope (USE, or
+ * CREATE or DROP of a DATABASE or SCHEMA), a session variable or setting (SET, UNSET, ALTER
+ * SESSION), or a temporary object. CREATE TABLE and its kind leave the session as it was. */
+static int touches_session(char words[SESSION_WORDS][SESSION_WORD_MAX], int count) {
+    if (count == 0) {
+        return 0;
+    }
+    const char *verb = words[0];
+    if (strcmp(verb, "USE") == 0 || strcmp(verb, "SET") == 0 || strcmp(verb, "UNSET") == 0) {
+        return 1;
+    }
+    int alter = strcmp(verb, "ALTER") == 0;
+    int create = strcmp(verb, "CREATE") == 0;
+    if (!alter && !create && strcmp(verb, "DROP") != 0) {
+        return 0;
+    }
+    int i = 1;
+    int temporary = 0;
+    while (i < count && is_one_of(words[i], object_modifiers)) {
+        temporary = temporary || is_one_of(words[i], temporary_modifiers);
+        i++;
+    }
+    const char *kind = i < count ? words[i] : "";
+    if (alter) {
+        return strcmp(kind, "SESSION") == 0;
+    }
+    return strcmp(kind, "DATABASE") == 0 || strcmp(kind, "SCHEMA") == 0 || (create && temporary);
+}
+
+/* 1 when a statement opens a transaction, -1 when it ends one, 0 otherwise. BEGIN on its own (or
+ * with TRANSACTION, WORK or NAME) opens one; BEGIN followed by a statement opens a scripting block
+ * instead. */
+static int transaction_effect(char words[SESSION_WORDS][SESSION_WORD_MAX], int count) {
+    if (count == 0) {
+        return 0;
+    }
+    const char *second = count > 1 ? words[1] : NULL;
+    if (strcmp(words[0], "COMMIT") == 0 || strcmp(words[0], "ROLLBACK") == 0) {
+        return -1;
+    }
+    if (strcmp(words[0], "START") == 0) {
+        return second != NULL && strcmp(second, "TRANSACTION") == 0 ? 1 : 0;
+    }
+    if (strcmp(words[0], "BEGIN") != 0) {
+        return 0;
+    }
+    return second == NULL || strcmp(second, "TRANSACTION") == 0 || strcmp(second, "WORK") == 0
+        || strcmp(second, "NAME") == 0 ? 1 : 0;
+}
+
+/* The request is read statement by statement, split on its top-level semicolons. A scripting block
+ * is split along with everything else, which only makes the checks more willing to flag a request —
+ * the safe direction to be wrong in. */
+void pdo_frostlake_track_session(pdo_frostlake_db_handle *H, const char *sql, size_t length) {
+    const char *end = sql + length;
+    const char *statement = sql;
+    const char *c = sql;
+    for (;;) {
+        if (c < end) {
+            const char *past = skip_non_placeholder(sql, c, end);
+            if (past != NULL) {
+                c = past;
+                continue;
+            }
+            if (*c != ';') {
+                c++;
+                continue;
+            }
+        }
+        char words[SESSION_WORDS][SESSION_WORD_MAX];
+        int count = leading_words(statement, c, words);
+        if (touches_session(words, count)) {
+            H->dirty = true;
+        }
+        int effect = transaction_effect(words, count);
+        if (effect < 0) {
+            H->in_transaction = false;
+        } else if (effect > 0 || (!H->opened_auto_commit && count > 0)) {
+            /* With autocommit off, any statement may have opened a transaction of its own. */
+            H->in_transaction = true;
+        }
+        if (c >= end) {
+            break;
+        }
+        c++;
+        statement = c;
+    }
 }

@@ -30,7 +30,7 @@ JSON codec keeps each NUMBER's exact text instead of passing it through a C doub
 
 - **PHP 8.1 to 8.5** with PDO, thread-safe or not. Tested with 8.1.34, 8.2.33, 8.3.33, 8.4.24,
   8.4.25 (ZTS) and 8.5.10 on Linux. Windows is not supported: the HTTP client is POSIX sockets.
-- **Frostlake engine 0.1.0 or newer**. Ask a running server which one it is with
+- **Frostlake engine 0.2.0 or newer**. Ask a running server which one it is with
   `SELECT CURRENT_VERSION()`. The driver is versioned separately from the engine; it speaks the
   HTTP protocol, so this is a minimum version, not a pin.
 - A C compiler and PHP's development headers (`php8.4-dev` on Debian and Ubuntu, included in the
@@ -125,11 +125,14 @@ so the driver substitutes each value as a literal of its declared type:
 
 The driver finds the placeholders itself, not PDO. PDO's own parser would read the VARIANT path
 in `v:field` as a named parameter. Text inside string literals, quoted identifiers, comments and
-`$$…$$` bodies is never a placeholder, and neither are `::` casts or a `:` that follows a value
-(`PARSE_JSON(x):k`, `arr[0]:k`). With nothing bound, the statement is sent exactly as written, so
-a Snowflake Scripting cursor's own `?` (`OPEN c USING (…)`) reaches the engine. A count mismatch,
-an unknown name, or mixed styles fail with `HY093`. `debugDumpParams()` shows the SQL that was
-sent.
+`$$…$$` bodies is never a placeholder, and neither are `::` casts or a `:` straight after the end
+of an operand (a name or number, a closing parenthesis, bracket, brace or quote, or a `?`), which
+reads a path: `v:k`, `PARSE_JSON(x):k`, `arr[0]:k`, `{'k': 1}:k`, `?:k`. With a blank before it,
+as in `v :k`, the colon opens a placeholder. With nothing bound, the statement is sent exactly as
+written, so a Snowflake Scripting cursor's own `?` (`OPEN c USING (…)`) reaches the engine. A count
+mismatch, an unknown name, or mixed styles fail with `HY093`, for example
+`SQLSTATE[HY093]: Invalid parameter number: parameter was not defined: :id`, and `errorInfo[2]`
+holds the text after `Invalid parameter number:`. `debugDumpParams()` shows the SQL that was sent.
 
 **Several statements.** A request holds one statement unless it asks for more, as on the account:
 `Actual statement count 2 did not match the desired statement count 1.` Ask the way
@@ -158,11 +161,30 @@ autocommit off. As with `pdo_snowflake`, which sends autocommit only when it log
 attribute later is recorded but does not change the session.
 
 **Sessions.** The server's session is pinned to the connection, so `USE`, variables, temporary
-tables and transactions last as long as the connection. Closing the connection releases the
-session and rolls back any transaction it left open. If the session disappears (idle timeout,
-server restart), the next statement fails with SQLSTATE `08003` instead of running in a new
-session without the connection's context. A persistent connection (`PDO::ATTR_PERSISTENT`) is
-reused only while its session is still alive; otherwise PDO opens a new one.
+tables and transactions last as long as the connection. The engine ends a session after 30 minutes
+idle, when it is released, or when the server restarts.
+
+- *What is sent.* Every request after the first names the session, and once the engine has shown
+  that it reports `newSession` (0.1.0 and later do), it also carries `requireSession: true`, so a
+  session the engine no longer holds is refused instead of being quietly replaced by a fresh one
+  without the connection's context. An engine that does not report `newSession` is sent neither
+  that field nor the release below.
+- *After a lost session.* Nothing ran. If the lost session held nothing of its own, the driver
+  starts a fresh session, puts the data source's role, warehouse, database and schema back on it
+  the way connecting does (a role the engine refuses fails, the rest are left off), and sends the
+  statement once more; a second refusal fails with SQLSTATE `08003`. If the lost session held an
+  open transaction — with autocommit off, any statement since the last `COMMIT` or `ROLLBACK`
+  may have opened one — or context set up with `USE`, `SET`/`UNSET`, `ALTER SESSION`, a temporary
+  object or a `CREATE`/`DROP` of a database or schema, the statement fails with `08003` and is not
+  re-run, and the message says which. The connection stays usable: its next statement starts a
+  fresh session on the data source's scope. End PDO's own transaction with `rollBack()` first.
+- *Close.* Closing the connection sends `DELETE /api/sessions/{id}`, which releases the session
+  and rolls back any transaction it left open. It is best effort, bounded by the connection's
+  timeout or ten seconds, whichever is shorter, and never raises.
+- *Persistent connections.* A persistent connection (`PDO::ATTR_PERSISTENT`) is reused only while
+  it can go on where it left off. One whose lost session held nothing is put on a fresh session on
+  its scope and reused; one whose lost session held a transaction or context is not, and PDO opens
+  a new one, while a `PDO` object still holding the old handle is told on its next statement.
 
 **Errors.** A statement the engine refuses fails with SQLSTATE `HY000` and the engine's message in
 `errorInfo[2]`; the engine has no native error code, so `errorInfo[1]` is `null`. An unreachable
@@ -193,8 +215,24 @@ make test
 The suite starts a private server (`-Duser.home` in a temporary directory) from the engine jar in
 the local Maven repository: `FROSTLAKE_VERSION` (default `0.1.0`), or any classpath through
 `FROSTLAKE_CLASSPATH`. To use a running server instead, set `FROSTLAKE_URL=http://host:port`. The
-three session tests read session ids from the server's log, so they skip against a server the
-harness did not start. `tests/run.sh <script.php>` runs any other script the same way.
+session tests that release a session behind the connection's back read session ids from the
+server's log (`FROSTLAKE_ENGINE_LOG`, which the harness sets for the server it starts), so they skip
+against a server the harness did not start. The other session tests need no engine at all: they
+run against `tests/scripted_engine.php`, a small server that answers every request from a script.
+`tests/run.sh <script.php>` runs any other script the same way.
+
+With `FL_CORPUS` naming the engine's testkit directory (best as an absolute path), the suite also
+replays the engine's language-neutral corpus through the driver, and fails when any case does:
+
+```bash
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit make test
+```
+
+It runs `tests/testkit_runner.php` through `tests/run.sh`, on a server of its own from
+`FROSTLAKE_CLASSPATH` or against `FROSTLAKE_URL`. It is skipped without `FL_CORPUS`, and without
+either of those rather than replayed on the released jar.
+`tests/run.sh tests/testkit_runner.php [--suite <word>]` runs the replay alone. The report, one
+row per case, is `build/testkit/testkit-pdo.tsv`.
 
 ## Layout
 
@@ -210,4 +248,6 @@ harness did not start. `tests/run.sh <script.php>` runs any other script the sam
 | `composer.json` | the package PIE installs from Packagist |
 | `Makefile` | the direct build and `make test` |
 | `tests/pdo_frostlake_test.php` | the driver's suite |
+| `tests/scripted_engine.php` | the scripted server the session tests run against |
+| `tests/testkit_runner.php` | replays the engine's testkit corpus through the driver |
 | `tests/run.sh` | starts a throwaway server and runs a test script against it |
