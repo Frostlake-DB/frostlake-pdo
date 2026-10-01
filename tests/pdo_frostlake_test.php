@@ -128,7 +128,7 @@ test('driver is registered with its attribute constant', function () {
 
 test('client version and driver name', function () {
     $pdo = connect();
-    same('0.1.0', $pdo->getAttribute(PDO::ATTR_CLIENT_VERSION), 'client version');
+    same('0.2.0', $pdo->getAttribute(PDO::ATTR_CLIENT_VERSION), 'client version');
     same('frostlake', $pdo->getAttribute(PDO::ATTR_DRIVER_NAME), 'driver name');
     same(1, $pdo->getAttribute(PDO::ATTR_AUTOCOMMIT), 'autocommit reads as an integer');
     $e = refusal(fn () => $pdo->getAttribute(PDO::ATTR_SERVER_VERSION));

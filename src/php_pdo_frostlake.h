@@ -20,7 +20,7 @@
 extern zend_module_entry pdo_frostlake_module_entry;
 #define phpext_pdo_frostlake_ptr &pdo_frostlake_module_entry
 
-#define PHP_PDO_FROSTLAKE_VERSION "0.1.0"
+#define PHP_PDO_FROSTLAKE_VERSION "0.2.0"
 
 #if defined(ZTS) && defined(COMPILE_DL_PDO_FROSTLAKE)
 ZEND_TSRMLS_CACHE_EXTERN()

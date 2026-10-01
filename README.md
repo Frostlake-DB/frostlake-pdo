@@ -213,7 +213,7 @@ make test
 ```
 
 The suite starts a private server (`-Duser.home` in a temporary directory) from the engine jar in
-the local Maven repository: `FROSTLAKE_VERSION` (default `0.1.0`), or any classpath through
+the local Maven repository: `FROSTLAKE_VERSION` (default `0.2.0`), or any classpath through
 `FROSTLAKE_CLASSPATH`. To use a running server instead, set `FROSTLAKE_URL=http://host:port`. The
 session tests that release a session behind the connection's back read session ids from the
 server's log (`FROSTLAKE_ENGINE_LOG`, which the harness sets for the server it starts), so they skip
